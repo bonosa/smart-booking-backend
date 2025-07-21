@@ -9,14 +9,50 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 // Middleware
-app.use(cors({
-  origin: process.env.NODE_ENV === 'production' 
-    ? ['https://your-frontend-domain.vercel.app', 'https://your-frontend-domain.netlify.app'] 
-    : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:4173']
-}));
+const corsOptions = {
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:8080',
+    'https://smart-booking-backend-production.up.railway.app',
+    
+    // ADD YOUR VERCEL URL HERE:
+    'https://appointment-flow-guru-acwc7u22c-saroj-bonos-projects.vercel.app'
+  ],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+// POST /send-email
+app.post('/send-email', async (req, res) => {
+  try {
+    const { to, subject, html } = req.body;
+    
+    // Use your email service (Nodemailer, SendGrid, etc.)
+    const transporter = nodemailer.createTransporter({
+      service: 'gmail', // or your email service
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASSWORD
+      }
+    });
 
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: to,
+      subject: subject,
+      html: html
+    };
+
+    await transporter.sendMail(mailOptions);
+    
+    res.json({ success: true, message: 'Email sent successfully' });
+  } catch (error) {
+    console.error('Email error:', error);
+    res.status(500).json({ success: false, message: 'Failed to send email' });
+  }
+});
 // Database connection (Railway PostgreSQL)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

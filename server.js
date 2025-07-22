@@ -46,6 +46,7 @@ app.post('/send-email', async (req, res) => {
     };
 
     await transporter.sendMail(mailOptions);
+    console.log('🚀 CORS fix deployed for Vercel frontend');
     
     res.json({ success: true, message: 'Email sent successfully' });
   } catch (error) {

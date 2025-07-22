@@ -16,7 +16,7 @@ const corsOptions = {
     'https://smart-booking-backend-production.up.railway.app',
     
     // ADD YOUR VERCEL URL HERE:
-    'https://appointment-flow-guru-acwc7u22c-saroj-bonos-projects.vercel.app'
+    'https://appointment-flow-guru-new.vercel.app/C'
   ],
   credentials: true,
   optionsSuccessStatus: 200

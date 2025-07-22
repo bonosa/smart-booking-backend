@@ -248,15 +248,22 @@ async function testDB() {
 // Test email configuration
 async function testEmail() {
   try {
-    // Only verify email in production (Vercel)
+    // Only verify email in production (Railway/Vercel)
     if (process.env.NODE_ENV === 'production') {
-      await emailTransporter.verify();
-      console.log('✅ Email service configured successfully');
+      // Railway-specific email test with timeout
+      const emailPromise = emailTransporter.verify();
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Email verification timeout')), 10000)
+      );
+      
+      await Promise.race([emailPromise, timeoutPromise]);
+      console.log('✅ Email service configured successfully for Railway');
     } else {
       console.log('⚠️  Skipping email verification in development (will work in production)');
     }
   } catch (error) {
     console.error('❌ Email service configuration failed:', error);
+    console.log('⚠️  Email will be retried on first use');
   }
 }
 
@@ -398,12 +405,16 @@ Respond with ONLY a JSON object:
   "mood": "helpful" or "excited" or "professional"
 }
 
-Guidelines:
+IMPORTANT GUIDELINES:
+- NEVER mention fake statistics like "10k customers" or "80% time reduction"
+- ONLY reference real data from the social media posts above
+- If no real social posts are available, focus on AI capabilities without statistics
 - If users want to book, guide them enthusiastically
 - If they ask about social media, reference the real posts above
 - Focus on the AI capabilities and user benefits
 - Be helpful and engaging, not robotic
-- Keep responses conversational and natural`;
+- Keep responses conversational and natural
+- Do not make up customer numbers or success metrics`;
 
     const response = await anthropic.messages.create({
       model: 'claude-3-sonnet-20240229',

@@ -9,6 +9,7 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 // Middleware
+
 const corsOptions = {
   origin: [
     'http://localhost:3000',
@@ -19,7 +20,7 @@ const corsOptions = {
   
     
     // NEW Vercel URL:
-    'https://appointment-flow-guru-gvwlpgnof-saroj-bonos-projects.vercel.app'
+    'https://appointment-flow-guru-new0.vercel.app/'
   ],
   credentials: true,
   optionsSuccessStatus: 200

@@ -4,6 +4,8 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 const Anthropic = require('@anthropic-ai/sdk');
+const axios = require('axios');
+const xml2js = require('xml2js');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -53,11 +55,20 @@ app.post('/send-email', async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to send email' });
   }
 });
-// Database connection (Railway PostgreSQL)
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
+// Database connection (Railway PostgreSQL) - only if DATABASE_URL is properly configured
+let pool = null;
+if (process.env.DATABASE_URL && 
+    process.env.DATABASE_URL !== 'base' && 
+    !process.env.DATABASE_URL.includes('base') &&
+    process.env.DATABASE_URL.startsWith('postgresql://')) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  });
+  console.log('✅ Database connection configured');
+} else {
+  console.log('⚠️  DATABASE_URL not properly configured. Database features will be disabled.');
+}
 
 // Anthropic AI client
 const anthropic = new Anthropic({
@@ -73,9 +84,91 @@ const emailTransporter = nodemailer.createTransport({
   }
 });
 
+// RSS Feed parser for X posts
+async function fetchXPosts() {
+  try {
+    // X RSS feed URL (you'll need to replace with your actual X RSS feed)
+    const xRssUrl = process.env.X_RSS_FEED_URL || 'https://nitter.net/yourusername/rss';
+    
+    const response = await axios.get(xRssUrl, {
+      timeout: 10000,
+      headers: {
+        'User-Agent': 'SmartBookingPro/1.0'
+      }
+    });
+    
+    const parser = new xml2js.Parser();
+    const result = await parser.parseStringPromise(response.data);
+    
+    // Extract recent posts about smart booking/Calendly
+    const posts = result.rss.channel[0].item || [];
+    const relevantPosts = posts
+      .filter(post => {
+        const title = post.title[0].toLowerCase();
+        const description = post.description[0].toLowerCase();
+        return title.includes('calendly') || 
+               title.includes('booking') || 
+               title.includes('appointment') ||
+               description.includes('calendly') || 
+               description.includes('booking') || 
+               description.includes('appointment');
+      })
+      .slice(0, 3); // Get latest 3 relevant posts
+    
+    // Cache the posts in database (if available)
+    if (relevantPosts.length > 0 && pool) {
+      try {
+        await pool.query(
+          'INSERT INTO social_media_cache (platform, post_data, fetched_at) VALUES ($1, $2, NOW()) ON CONFLICT (platform) DO UPDATE SET post_data = $2, fetched_at = NOW()',
+          ['x', JSON.stringify(relevantPosts)]
+        );
+      } catch (dbError) {
+        console.log('⚠️  Could not cache posts in database, but RSS fetch was successful');
+      }
+    }
+    
+    return relevantPosts;
+  } catch (error) {
+    console.error('Failed to fetch X posts:', error);
+    return [];
+  }
+}
+
+// Get cached social media posts
+async function getCachedSocialPosts() {
+  try {
+    // Check if database is available
+    if (!pool) {
+      console.log('⚠️  Fetching fresh social posts (no database cache available)');
+      return await fetchXPosts();
+    }
+
+    const result = await pool.query(
+      'SELECT post_data FROM social_media_cache WHERE platform = $1 AND fetched_at > NOW() - INTERVAL \'1 hour\'',
+      ['x']
+    );
+    
+    if (result.rows.length > 0) {
+      return JSON.parse(result.rows[0].post_data);
+    }
+    
+    // If no recent cache, fetch fresh posts
+    return await fetchXPosts();
+  } catch (error) {
+    console.error('Failed to get cached social posts:', error);
+    return await fetchXPosts();
+  }
+}
+
 // Initialize database tables
 async function initDB() {
   try {
+    // Check if pool exists (database is configured)
+    if (!pool) {
+      console.log('⚠️  Database not configured - skipping table initialization');
+      return;
+    }
+
     // Bookings table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bookings (
@@ -139,6 +232,11 @@ async function initDB() {
 
 // Test database connection
 async function testDB() {
+  if (!pool) {
+    console.log('⚠️  Database not configured - skipping connection test');
+    return;
+  }
+  
   try {
     const result = await pool.query('SELECT NOW()');
     console.log('✅ Database connected:', result.rows[0].now);
@@ -150,8 +248,13 @@ async function testDB() {
 // Test email configuration
 async function testEmail() {
   try {
-    await emailTransporter.verify();
-    console.log('✅ Email service configured successfully');
+    // Only verify email in production (Vercel)
+    if (process.env.NODE_ENV === 'production') {
+      await emailTransporter.verify();
+      console.log('✅ Email service configured successfully');
+    } else {
+      console.log('⚠️  Skipping email verification in development (will work in production)');
+    }
   } catch (error) {
     console.error('❌ Email service configuration failed:', error);
   }
@@ -171,22 +274,44 @@ app.get('/health', async (req, res) => {
   };
 
   // Test database
-  try {
-    await pool.query('SELECT 1');
-    health.services.database = 'connected';
-  } catch (error) {
-    health.services.database = 'error';
+  if (pool) {
+    try {
+      await pool.query('SELECT 1');
+      health.services.database = 'connected';
+    } catch (error) {
+      health.services.database = 'error';
+    }
+  } else {
+    health.services.database = 'not configured';
   }
 
-  // Test email
-  try {
-    await emailTransporter.verify();
-    health.services.email = 'configured';
-  } catch (error) {
-    health.services.email = 'error';
+  // Test email (only in production)
+  if (process.env.NODE_ENV === 'production') {
+    try {
+      const emailPromise = emailTransporter.verify();
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      );
+      await Promise.race([emailPromise, timeoutPromise]);
+      health.services.email = 'configured';
+    } catch (error) {
+      health.services.email = 'error';
+    }
+  } else {
+    health.services.email = 'skipped (development)';
   }
 
   res.json(health);
+});
+
+// Simple test endpoint
+app.get('/test', (req, res) => {
+  res.json({
+    message: '✅ Server is working!',
+    timestamp: new Date().toISOString(),
+    database: pool ? 'connected' : 'not connected',
+    ai: process.env.ANTHROPIC_API_KEY ? 'configured' : 'not configured'
+  });
 });
 
 // Root endpoint
@@ -202,6 +327,7 @@ app.get('/', (req, res) => {
       'Multi-Interface Support'
     ],
     endpoints: {
+      test: '/test',
       health: '/health',
       chatbot: '/api/chatbot',
       analyze: '/api/analyze-message',
@@ -241,18 +367,18 @@ app.post('/api/chatbot', async (req, res) => {
       }
     }
 
-    // Enhanced chatbot prompt with social media context
+    // Get real social media posts
+    const socialPosts = await getCachedSocialPosts();
+    const socialContext = socialPosts.length > 0 
+      ? `\nRecent Social Media Posts:\n${socialPosts.map(post => `- ${post.title[0]}: ${post.description[0]}`).join('\n')}`
+      : '';
+
+    // Enhanced chatbot prompt with real social media context
     const chatbotPrompt = `You are a smart, engaging booking assistant for Smart Booking Pro - an AI-powered appointment booking system.
 
 Current Context:
 - User message: "${message}"
-- Chat history: ${JSON.stringify(context?.userHistory?.slice(-3) || [])}
-- Social media trends: #SmartBooking #AIAppointments #AutomatedScheduling
-
-Social Media Context:
-- Twitter: "Just launched our AI booking system! 🚀 Reduced booking time by 80% #SmartBooking"
-- LinkedIn: "Case study: How AI transformed appointment scheduling for 500+ businesses"
-- Instagram: "Behind the scenes: Our Claude AI integration process ✨"
+- Chat history: ${JSON.stringify(context?.userHistory?.slice(-3) || [])}${socialContext}
 
 Your capabilities:
 - Book appointments through natural conversation
@@ -260,22 +386,22 @@ Your capabilities:
 - Generate personalized emails
 - Provide smart scheduling recommendations
 - Answer questions about services (Business, Technical, Medical consultations)
-- Reference social media when relevant
+- Reference real social media posts when relevant
 
 Personality: Friendly, helpful, professional, use emojis sparingly, be conversational.
 
 Respond with ONLY a JSON object:
 {
-  "content": "Your engaging, helpful response (mention social media context when relevant)",
+  "content": "Your engaging, helpful response (reference real social posts when relevant)",
   "suggestions": ["Quick reply 1", "Quick reply 2", "Quick reply 3"],
-  "action": "book_appointment" or "show_social" or "explain_features" or null,
+  "action": "book_appointment" or "explain_features" or "show_social" or null,
   "mood": "helpful" or "excited" or "professional"
 }
 
 Guidelines:
 - If users want to book, guide them enthusiastically
-- If they ask about features, mention our 80% time reduction
-- If they mention social media, reference our actual posts
+- If they ask about social media, reference the real posts above
+- Focus on the AI capabilities and user benefits
 - Be helpful and engaging, not robotic
 - Keep responses conversational and natural`;
 
@@ -647,6 +773,21 @@ app.get('/api/bookings', async (req, res) => {
   }
 });
 
+// Refresh social media posts
+app.post('/api/refresh-social-posts', async (req, res) => {
+  try {
+    const posts = await fetchXPosts();
+    res.json({ 
+      success: true, 
+      postsCount: posts.length,
+      message: 'Social media posts refreshed successfully'
+    });
+  } catch (error) {
+    console.error('Failed to refresh social posts:', error);
+    res.status(500).json({ error: 'Failed to refresh social posts' });
+  }
+});
+
 // Get analytics and stats
 app.get('/api/stats', async (req, res) => {
   try {
@@ -688,25 +829,16 @@ function generateFallbackResponse(message) {
   
   if (lowerMessage.includes('book') || lowerMessage.includes('appointment') || lowerMessage.includes('schedule')) {
     return {
-      content: "I'd be happy to help you book an appointment! 📅 Our AI-powered system makes scheduling super fast and easy. According to our recent social media posts, we've reduced booking time by 80%! Ready to experience it yourself?",
+      content: "I'd be happy to help you book an appointment! 📅 Our AI-powered system makes scheduling super fast and easy. I can understand your needs and find the perfect time slot for you. Ready to get started?",
       suggestions: ["Yes, let's book!", "Tell me more about AI booking", "What services do you offer?"],
       action: "book_appointment",
       mood: "excited"
     };
   }
 
-  if (lowerMessage.includes('social') || lowerMessage.includes('twitter') || lowerMessage.includes('instagram') || lowerMessage.includes('linkedin')) {
-    return {
-      content: "Great question about our social media! 📱 We're active across platforms sharing our AI booking innovations:\n\n🐦 Twitter: Latest features and quick tips about smart scheduling\n💼 LinkedIn: Case studies showing 80% time reduction for clients\n📸 Instagram: Behind-the-scenes of our Claude AI development\n\nOur community loves how we've revolutionized appointment booking! What caught your attention?",
-      suggestions: ["Book an appointment", "Learn about AI features", "Tell me about the 80% improvement"],
-      action: "show_social",
-      mood: "helpful"
-    };
-  }
-
   if (lowerMessage.includes('ai') || lowerMessage.includes('claude') || lowerMessage.includes('how') || lowerMessage.includes('features')) {
     return {
-      content: "Our system uses cutting-edge Claude AI technology! 🤖 Here's what makes Smart Booking Pro special:\n\n✨ Intelligent message analysis\n⏱️ Smart duration suggestions based on content\n📧 Personalized email generation\n🎯 Optimal time slot recommendations\n📊 Real-time analytics and insights\n\nAs featured across our social media, this AI integration has reduced booking time by 80% for our users! Want to experience the magic yourself?",
+      content: "Our system uses cutting-edge Claude AI technology! 🤖 Here's what makes Smart Booking Pro special:\n\n✨ Intelligent message analysis\n⏱️ Smart duration suggestions based on content\n📧 Personalized email generation\n🎯 Optimal time slot recommendations\n📊 Real-time analytics and insights\n\nWant to experience the magic yourself?",
       suggestions: ["Book an appointment", "See it in action", "What services do you offer?"],
       action: "explain_features",
       mood: "professional"
@@ -724,7 +856,7 @@ function generateFallbackResponse(message) {
 
   // Default response
   return {
-    content: "Hello! 👋 I'm your Smart Booking AI assistant, powered by Claude AI. I make appointment scheduling incredibly easy and fast!\n\n🚀 According to our social media, we've helped users reduce booking time by 80%\n💬 I can chat naturally to understand your needs\n📅 I'll find the perfect appointment slot for you\n📧 I'll send beautiful confirmation emails\n\nWhat can I help you with today?",
+    content: "Hello! 👋 I'm your Smart Booking AI assistant, powered by Claude AI. I make appointment scheduling incredibly easy and fast!\n\n💬 I can chat naturally to understand your needs\n📅 I'll find the perfect appointment slot for you\n📧 I'll send beautiful confirmation emails\n\nWhat can I help you with today?",
     suggestions: ["Book an appointment", "Learn about AI features", "View our services", "Tell me more"],
     action: null,
     mood: "friendly"
@@ -779,13 +911,17 @@ async function startServer() {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('Received SIGTERM, shutting down gracefully...');
-  await pool.end();
+  if (pool) {
+    await pool.end();
+  }
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
   console.log('Received SIGINT, shutting down gracefully...');
-  await pool.end();
+  if (pool) {
+    await pool.end();
+  }
   process.exit(0);
 });
 
